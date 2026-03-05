@@ -772,11 +772,13 @@ class SerenaAgent:
             ls_timeout = tool_timeout - 5  # the LS timeout is for a single call, it should be smaller than the tool timeout
 
         # instantiate and start the necessary language servers
-        self.get_active_project_or_raise().create_language_server_manager(
+        active_project = self.get_active_project_or_raise()
+        ls_specific_settings = {**self.serena_config.ls_specific_settings, **active_project.project_config.ls_specific_settings}
+        active_project.create_language_server_manager(
             log_level=self.serena_config.log_level,
             ls_timeout=ls_timeout,
             trace_lsp_communication=self.serena_config.trace_lsp_communication,
-            ls_specific_settings=self.serena_config.ls_specific_settings,
+            ls_specific_settings=ls_specific_settings,
         )
 
     def add_language(self, language: Language) -> None:
