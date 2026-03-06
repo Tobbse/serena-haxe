@@ -119,6 +119,13 @@ default_modes:
 # (contrary to the memories, which are loaded on demand).
 initial_prompt: ""
 
+# language-server-specific settings, keyed by language name.
+# Example:
+#   ls_specific_settings:
+#     haxe:
+#       ls_path: "/path/to/haxe-language-server/bin/server.js"
+ls_specific_settings: {}
+
 # time budget (seconds) per tool call for the retrieval of additional symbol information
 # such as docstrings or parameter information.
 # This overrides the corresponding setting in the global configuration; see the documentation there.

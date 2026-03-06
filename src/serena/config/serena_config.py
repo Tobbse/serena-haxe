@@ -364,6 +364,7 @@ class ProjectConfig(SharedConfig):
             base_modes=data["base_modes"],
             default_modes=data["default_modes"],
             symbol_info_budget=symbol_info_budget,
+            ls_specific_settings=data.get("ls_specific_settings", {}),
         )
 
     def _to_yaml_dict(self) -> dict:
