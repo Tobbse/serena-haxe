@@ -58,6 +58,15 @@ class HaxeLanguageServer(SolidLanguageServer):
             solidlsp_settings,
         )
 
+        # Compilation synchronisation: starts SET (= already done), cleared when the server
+        # sends window/workDoneProgress/create or $/progress begin, set again once all
+        # progress tokens have ended. This ensures hover/references requests are not sent
+        # while the Haxe compiler is still building the project.
+        self._compilation_complete = threading.Event()
+        self._compilation_complete.set()
+        self._active_progress_tokens: set[str] = set()
+        self._progress_lock = threading.Lock()
+
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
         return self.DependencyProvider(self._custom_settings, self._ls_resources_dir)
 
@@ -124,6 +133,8 @@ class HaxeLanguageServer(SolidLanguageServer):
             Attempt to download the Haxe language server from the VSCode marketplace.
             Downloads the vshaxe extension VSIX and extracts server.js from it.
             """
+            import gzip
+            import io
             import tempfile
             import zipfile
 
@@ -140,8 +151,17 @@ class HaxeLanguageServer(SolidLanguageServer):
 
                 urllib.request.urlretrieve(vsix_url, vsix_path)
 
+                # The marketplace may return gzip-compressed content;
+                # detect by checking the gzip magic bytes (\x1f\x8b)
+                with open(vsix_path, "rb") as f:
+                    raw_data = f.read()
+
+                if raw_data[:2] == b"\x1f\x8b":
+                    log.info("VSIX is gzip-compressed, decompressing...")
+                    raw_data = gzip.decompress(raw_data)
+
                 # VSIX files are ZIP archives; extract the language server binary
-                with zipfile.ZipFile(vsix_path, "r") as zf:
+                with zipfile.ZipFile(io.BytesIO(raw_data), "r") as zf:
                     # Find server.js in the extension
                     server_entries = [n for n in zf.namelist() if n.endswith("bin/server.js")]
                     if not server_entries:
@@ -471,9 +491,12 @@ class HaxeLanguageServer(SolidLanguageServer):
 
     def _start_server(self) -> None:
         """
-        Starts the Haxe Language Server, waits for the server to be ready and yields the LanguageServer instance.
+        Starts the Haxe Language Server, waits for compilation to complete, and yields the LanguageServer instance.
+
+        Uses $/progress token tracking (same pattern as Kotlin LS) to detect when the Haxe
+        compiler finishes its initial build. This is critical for large projects where
+        compilation can take significantly longer than the previous 30s diagnostics-based wait.
         """
-        workspace_ready = threading.Event()
 
         def do_nothing(params: dict) -> None:
             return
@@ -481,18 +504,50 @@ class HaxeLanguageServer(SolidLanguageServer):
         def window_log_message(msg: dict) -> None:
             log.info(f"LSP: window/logMessage: {msg}")
 
-        def on_diagnostics(params: dict) -> None:
-            log.info("LSP: Received diagnostics notification, workspace is ready")
-            workspace_ready.set()
-
         def register_capability_handler(params: dict) -> None:
             """Handle client/registerCapability requests from the server."""
             return
 
+        def work_done_progress_create(params: dict) -> dict:
+            """Handle window/workDoneProgress/create: the server is about to report async progress.
+            Clear the compilation-complete event so _start_server waits until all tokens finish.
+            """
+            token = str(params.get("token", ""))
+            log.debug(f"Haxe LSP workDoneProgress/create: token={token!r}")
+            with self._progress_lock:
+                self._active_progress_tokens.add(token)
+                self._compilation_complete.clear()
+            return {}
+
+        def progress_handler(params: dict) -> None:
+            """Track $/progress begin/end to detect when all async compilation work finishes."""
+            token = str(params.get("token", ""))
+            value = params.get("value", {})
+            kind = value.get("kind")
+            if kind == "begin":
+                title = value.get("title", "")
+                log.info(f"Haxe LSP progress [{token}]: started - {title}")
+                with self._progress_lock:
+                    self._active_progress_tokens.add(token)
+                    self._compilation_complete.clear()
+            elif kind == "report":
+                pct = value.get("percentage")
+                msg = value.get("message", "")
+                pct_str = f" ({pct}%)" if pct is not None else ""
+                log.debug(f"Haxe LSP progress [{token}]: {msg}{pct_str}")
+            elif kind == "end":
+                msg = value.get("message", "")
+                log.info(f"Haxe LSP progress [{token}]: ended - {msg}")
+                with self._progress_lock:
+                    self._active_progress_tokens.discard(token)
+                    if not self._active_progress_tokens:
+                        self._compilation_complete.set()
+
         self.server.on_request("client/registerCapability", register_capability_handler)
+        self.server.on_request("window/workDoneProgress/create", work_done_progress_create)
         self.server.on_notification("window/logMessage", window_log_message)
-        self.server.on_notification("$/progress", do_nothing)
-        self.server.on_notification("textDocument/publishDiagnostics", on_diagnostics)
+        self.server.on_notification("$/progress", progress_handler)
+        self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
 
         log.info("Starting Haxe server process")
         self.server.start()
@@ -506,16 +561,24 @@ class HaxeLanguageServer(SolidLanguageServer):
         # Force didChangeConfiguration — some Haxe LSP versions require this to properly start
         self.server.notify.workspace_did_change_configuration({"settings": {}})
 
-        log.info("Haxe server initialized, waiting for workspace scan...")
-
-        # Wait for workspace to be scanned (indicated by receiving diagnostics)
-        if workspace_ready.wait(timeout=30.0):
-            log.info("Haxe server workspace scan completed")
+        # Wait for compilation to complete.
+        # - If the Haxe LSP sends $/progress notifications (typical for projects with .hxml build files),
+        #   we wait until all progress tokens have ended.
+        # - If it never sends progress (e.g. very simple project or older LSP version),
+        #   _compilation_complete stays SET and wait() returns immediately.
+        _COMPILATION_TIMEOUT = 120.0
+        log.info("Waiting for Haxe LSP compilation to complete (if async)...")
+        if self._compilation_complete.wait(timeout=_COMPILATION_TIMEOUT):
+            log.info("Haxe server compilation completed, server ready")
         else:
-            log.warning("Timeout waiting for Haxe workspace scan, proceeding anyway")
+            log.warning(
+                "Haxe LSP did not signal compilation completion within %.0fs; proceeding anyway",
+                _COMPILATION_TIMEOUT,
+            )
 
         log.info("Haxe server ready")
 
     @override
     def _get_wait_time_for_cross_file_referencing(self) -> float:
-        return 2.0
+        """Small safety buffer since we already waited for compilation to complete in _start_server."""
+        return 1.0

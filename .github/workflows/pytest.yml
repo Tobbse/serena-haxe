@@ -363,6 +363,25 @@ jobs:
           echo "PERL_MB_OPT=--install_base \"$HOME/perl5\"" >> $GITHUB_ENV
           echo "PERL_MM_OPT=INSTALL_BASE=$HOME/perl5" >> $GITHUB_ENV
           echo "$HOME/perl5/bin" >> $GITHUB_PATH
+      - name: Install Haxe
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo add-apt-repository ppa:haxe/releases -y
+            sudo apt-get update
+            sudo apt-get install -y haxe
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew install haxe
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            choco install haxe -y
+          fi
+          # Verify installation
+          if command -v haxe &> /dev/null; then
+            echo "Haxe installed: $(haxe --version)"
+          else
+            echo "ERROR: Haxe installation failed"
+            exit 1
+          fi
       - name: Install Elm
         shell: bash
         run: npm install -g elm@0.19.1-6
