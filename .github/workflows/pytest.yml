@@ -373,7 +373,10 @@ jobs:
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
             brew install haxe
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            choco install haxe -y
+            # Use --ignore-dependencies to skip neko → vcredist2015 chain which
+            # can interfere with the .NET SDK (breaks F# tests).
+            # The Haxe compiler is standalone; Neko is only needed for haxelib.
+            choco install haxe -y --ignore-dependencies
           fi
           # Verify installation
           if command -v haxe &> /dev/null; then
