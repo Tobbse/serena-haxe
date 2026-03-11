@@ -555,36 +555,19 @@ class HaxeLanguageServer(SolidLanguageServer):
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
         self.server.send.initialize(initialize_params)
 
-        # Clear the event BEFORE sending initialized, so wait() will block
-        # until either progress tokens complete or the grace period expires.
-        # Without this, the event starts SET and wait() returns immediately —
-        # before the LSP has time to send window/workDoneProgress/create.
-        self._compilation_complete.clear()
-
         self.server.notify.initialized({})
 
         # Force didChangeConfiguration — some Haxe LSP versions require this to properly start
         self.server.notify.workspace_did_change_configuration({"settings": {}})
 
-        # Wait for compilation to complete. Two scenarios:
-        # 1. The Haxe LSP sends $/progress tokens (buildCompletionCache) — progress_handler
-        #    will set() the event when all tokens end.
-        # 2. The LSP doesn't send progress (very simple project / older version) — the grace
-        #    period timer below sets the event after _PROGRESS_GRACE_PERIOD seconds.
-        _PROGRESS_GRACE_PERIOD = 10.0
+        # Wait for compilation to complete (same pattern as Kotlin LS):
+        # - _compilation_complete starts SET (from __init__).
+        # - If the server sends window/workDoneProgress/create, work_done_progress_create
+        #   clears the event. wait() then blocks until all progress tokens end.
+        # - If the server never sends workDoneProgress/create (simple project / older version),
+        #   the event stays SET and wait() returns immediately.
+        # No grace period timer needed — the event is only cleared by actual server signals.
         _COMPILATION_TIMEOUT = 300.0
-
-        def _grace_period_expired() -> None:
-            with self._progress_lock:
-                if not self._active_progress_tokens:
-                    log.info("No progress tokens received within grace period — assuming compilation not needed")
-                    self._compilation_complete.set()
-                else:
-                    log.info("Progress tokens active after grace period — continuing to wait for compilation")
-
-        grace_timer = threading.Timer(_PROGRESS_GRACE_PERIOD, _grace_period_expired)
-        grace_timer.daemon = True
-        grace_timer.start()
 
         log.info("Waiting for Haxe LSP compilation to complete...")
         if self._compilation_complete.wait(timeout=_COMPILATION_TIMEOUT):
@@ -594,7 +577,6 @@ class HaxeLanguageServer(SolidLanguageServer):
                 "Haxe LSP did not signal compilation completion within %.0fs; proceeding anyway",
                 _COMPILATION_TIMEOUT,
             )
-        grace_timer.cancel()
 
         log.info("Haxe server ready")
 
