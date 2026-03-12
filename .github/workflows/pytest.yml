@@ -366,6 +366,7 @@ jobs:
       - name: Install Haxe
         shell: bash
         run: |
+          HAXE_VERSION="4.3.4"
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             sudo add-apt-repository ppa:haxe/releases -y
             sudo apt-get update
@@ -373,10 +374,27 @@ jobs:
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
             brew install haxe
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            # Use --ignore-dependencies to skip neko → vcredist2015 chain which
-            # can interfere with the .NET SDK (breaks F# tests).
-            # The Haxe compiler is standalone; Neko is only needed for haxelib.
-            choco install haxe -y --ignore-dependencies
+            # Download Haxe directly as a ZIP to avoid Chocolatey's dependency
+            # chain (neko → vcredist2015) which corrupts the .NET SDK and breaks
+            # F# tests with "System.Array assembly not found" errors.
+            HAXE_URL="https://github.com/HaxeFoundation/haxe/releases/download/${HAXE_VERSION}/haxe-${HAXE_VERSION}-win64.zip"
+            echo "Downloading Haxe ${HAXE_VERSION} from ${HAXE_URL}"
+            curl -fsSL "$HAXE_URL" -o haxe.zip
+            unzip -q haxe.zip -d /c/haxe
+            # The ZIP extracts to a versioned subdirectory like haxe_20240304101237_dc1a43d
+            HAXE_DIR=$(ls -d /c/haxe/haxe_* 2>/dev/null | head -1)
+            if [[ -z "$HAXE_DIR" ]]; then
+              # Fallback: try haxe-VERSION directory naming
+              HAXE_DIR=$(ls -d /c/haxe/haxe-* 2>/dev/null | head -1)
+            fi
+            if [[ -z "$HAXE_DIR" ]]; then
+              echo "ERROR: Could not find extracted Haxe directory in /c/haxe/"
+              ls -la /c/haxe/
+              exit 1
+            fi
+            echo "Haxe extracted to: $HAXE_DIR"
+            echo "$HAXE_DIR" >> $GITHUB_PATH
+            export PATH="$HAXE_DIR:$PATH"
           fi
           # Verify installation
           if command -v haxe &> /dev/null; then
