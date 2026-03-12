@@ -228,6 +228,37 @@ class HaxeLanguageServer(SolidLanguageServer):
 
         return result
 
+    @override
+    def request_hover(
+        self, relative_file_path: str, line: int, column: int, file_buffer: LSPFileBuffer | None = None
+    ) -> ls_types.Hover | None:
+        """Override to handle Haxe LSP returning None for class-level hover.
+
+        The Haxe language server does not provide hover information for class
+        declarations, only for methods and fields. When hover returns None, fall
+        back to using document symbols to find the symbol name at the given
+        position and return a synthetic hover with the class/type name.
+        """
+        result = super().request_hover(relative_file_path, line, column, file_buffer=file_buffer)
+        if result is not None:
+            return result
+
+        # Hover returned None — try to find the symbol name from document symbols
+        try:
+            doc_symbols = self.request_document_symbols(relative_file_path, file_buffer=file_buffer)
+            all_symbols, _ = doc_symbols.get_all_symbols_and_roots()
+            for sym in all_symbols:
+                sel_range = sym.get("selectionRange", {})
+                start = sel_range.get("start", {})
+                if start.get("line") == line and start.get("character") == column:
+                    name = sym.get("name", "")
+                    if name:
+                        return {"contents": name}
+        except Exception:
+            log.debug("Failed to synthesize hover from document symbols", exc_info=True)
+
+        return None
+
     def _fix_symbol_boundaries(self, symbols: list[ls_types.UnifiedSymbolInformation], relative_file_path: str) -> None:
         """Walk the symbol tree and fix any symbols whose range extends
         beyond their actual body (common Haxe LSP bug).
@@ -490,15 +521,27 @@ class HaxeLanguageServer(SolidLanguageServer):
 
     def _start_server(self) -> None:
         """
-        Starts the Haxe Language Server, waits for compilation to complete, and yields the LanguageServer instance.
+        Starts the Haxe Language Server and waits for compilation to complete.
 
-        Uses $/progress token tracking (same pattern as Kotlin LS) to detect when the Haxe
-        compiler finishes its initial build. This is critical for large projects where
-        compilation can take significantly longer than the previous 30s diagnostics-based wait.
+        Uses textDocument/publishDiagnostics as the primary signal that compilation has
+        finished (the Haxe LSP always publishes diagnostics after compiling). Also tracks
+        $/progress tokens as a secondary signal. The event is cleared before sending
+        initialized and set when either signal arrives.
         """
 
         def do_nothing(params: dict) -> None:
             return
+
+        def diagnostics_handler(params: dict) -> None:
+            """Signal compilation complete when the first diagnostics arrive.
+
+            The Haxe LSP always publishes textDocument/publishDiagnostics after
+            compilation finishes (even an empty list for clean code). This is more
+            reliable than $/progress tokens which may not arrive in time on slow
+            CI runners.
+            """
+            log.info("Haxe LSP published diagnostics — compilation complete")
+            self._compilation_complete.set()
 
         def window_log_message(msg: dict) -> None:
             log.info(f"LSP: window/logMessage: {msg}")
@@ -546,7 +589,7 @@ class HaxeLanguageServer(SolidLanguageServer):
         self.server.on_request("window/workDoneProgress/create", work_done_progress_create)
         self.server.on_notification("window/logMessage", window_log_message)
         self.server.on_notification("$/progress", progress_handler)
-        self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
+        self.server.on_notification("textDocument/publishDiagnostics", diagnostics_handler)
 
         log.info("Starting Haxe server process")
         self.server.start()
@@ -555,18 +598,21 @@ class HaxeLanguageServer(SolidLanguageServer):
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
         self.server.send.initialize(initialize_params)
 
+        # Clear the event BEFORE sending initialized so wait() blocks until
+        # the Haxe LSP publishes diagnostics (= compilation finished).
+        self._compilation_complete.clear()
         self.server.notify.initialized({})
 
         # Force didChangeConfiguration — some Haxe LSP versions require this to properly start
         self.server.notify.workspace_did_change_configuration({"settings": {}})
 
-        # Wait for compilation to complete (same pattern as Kotlin LS):
-        # - _compilation_complete starts SET (from __init__).
-        # - If the server sends window/workDoneProgress/create, work_done_progress_create
-        #   clears the event. wait() then blocks until all progress tokens end.
-        # - If the server never sends workDoneProgress/create (simple project / older version),
-        #   the event stays SET and wait() returns immediately.
-        # No grace period timer needed — the event is only cleared by actual server signals.
+        # Wait for compilation to complete.
+        # The event was cleared above. It will be set by either:
+        # 1. diagnostics_handler — when the LSP publishes textDocument/publishDiagnostics
+        #    (always happens after compilation, even for clean code).
+        # 2. progress_handler — when all $/progress tokens end (if the LSP sends them).
+        # This is more reliable than progress tokens alone, which may not arrive
+        # in time on slow CI runners (e.g., Windows).
         _COMPILATION_TIMEOUT = 300.0
 
         log.info("Waiting for Haxe LSP compilation to complete...")
