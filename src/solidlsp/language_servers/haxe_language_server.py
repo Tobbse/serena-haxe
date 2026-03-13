@@ -239,11 +239,14 @@ class HaxeLanguageServer(SolidLanguageServer):
         back to using document symbols to find the symbol name at the given
         position and return a synthetic hover with the class/type name.
         """
-        result = super().request_hover(relative_file_path, line, column, file_buffer=file_buffer)
-        if result is not None:
-            return result
+        try:
+            result = super().request_hover(relative_file_path, line, column, file_buffer=file_buffer)
+            if result is not None:
+                return result
+        except Exception:
+            log.debug("Hover request failed, attempting fallback", exc_info=True)
 
-        # Hover returned None — try to find the symbol name from document symbols
+        # Hover returned None or raised — try to find the symbol name from document symbols
         try:
             doc_symbols = self.request_document_symbols(relative_file_path, file_buffer=file_buffer)
             all_symbols, _ = doc_symbols.get_all_symbols_and_roots()
@@ -629,4 +632,4 @@ class HaxeLanguageServer(SolidLanguageServer):
     @override
     def _get_wait_time_for_cross_file_referencing(self) -> float:
         """Small safety buffer since we already waited for compilation to complete in _start_server."""
-        return 1.0
+        return 5.0 if os.name == "nt" else 1.0
