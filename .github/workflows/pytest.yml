@@ -366,6 +366,7 @@ jobs:
       - name: Install Haxe
         shell: bash
         run: |
+          HAXE_VERSION="4.3.4"
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             sudo add-apt-repository ppa:haxe/releases -y
             sudo apt-get update
@@ -373,11 +374,33 @@ jobs:
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
             brew install haxe
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            choco install haxe -y --ignore-dependencies
+            # Download Haxe directly as a ZIP to avoid Chocolatey's dependency
+            # chain (neko -> vcredist2015) which corrupts the .NET SDK and breaks
+            # F# tests. Using --ignore-dependencies was tried but may cause Haxe
+            # compilation to fail (missing cross-file indexing on Windows CI).
+            HAXE_URL="https://github.com/HaxeFoundation/haxe/releases/download/${HAXE_VERSION}/haxe-${HAXE_VERSION}-win64.zip"
+            echo "Downloading Haxe ${HAXE_VERSION} from ${HAXE_URL}"
+            curl -fsSL "$HAXE_URL" -o haxe.zip
+            unzip -q haxe.zip -d /c/haxe
+            HAXE_DIR=$(ls -d /c/haxe/haxe_* 2>/dev/null | head -1)
+            if [[ -z "$HAXE_DIR" ]]; then
+              HAXE_DIR=$(ls -d /c/haxe/haxe-* 2>/dev/null | head -1)
+            fi
+            if [[ -z "$HAXE_DIR" ]]; then
+              echo "ERROR: Could not find extracted Haxe directory in /c/haxe/"
+              ls -la /c/haxe/
+              exit 1
+            fi
+            echo "Haxe extracted to: $HAXE_DIR"
+            echo "$HAXE_DIR" >> $GITHUB_PATH
+            export PATH="$HAXE_DIR:$PATH"
+            # Set HAXE_STD_PATH so the compiler finds the standard library
+            echo "HAXE_STD_PATH=$HAXE_DIR/std" >> $GITHUB_ENV
           fi
           # Verify installation
           if command -v haxe &> /dev/null; then
             echo "Haxe installed: $(haxe --version)"
+            echo "Haxe path: $(which haxe)"
           else
             echo "ERROR: Haxe installation failed"
             exit 1
@@ -556,6 +579,24 @@ jobs:
         run: |
           echo "Free disk space before tests:"
           df -h
+      - name: Verify Haxe test project compilation
+        shell: bash
+        run: |
+          if command -v haxe &> /dev/null; then
+            echo "=== Haxe compilation test ==="
+            echo "Haxe version: $(haxe --version 2>&1)"
+            echo "Working directory: $(pwd)"
+            cd test/resources/repos/haxe/test_repo
+            echo "Test repo contents:"
+            ls -la
+            echo "build.hxml contents:"
+            cat build.hxml
+            echo "=== Running haxe build.hxml ==="
+            haxe build.hxml 2>&1
+            echo "Haxe compilation exit code: $?"
+          else
+            echo "Haxe not installed — skipping compilation test"
+          fi
       - name: Test with pytest
         shell: bash
         run: uv run poe test

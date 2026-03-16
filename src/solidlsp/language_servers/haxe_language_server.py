@@ -7,6 +7,7 @@ import glob
 import logging
 import os
 import pathlib
+import re
 import shutil
 import threading
 
@@ -461,6 +462,7 @@ class HaxeLanguageServer(SolidLanguageServer):
             },
             "initializationOptions": {
                 "displayArguments": display_arguments,
+                "renameSourceFolders": self._extract_classpath_folders(display_arguments, repository_absolute_path),
             },
             "processId": os.getpid(),
             "rootPath": repository_absolute_path,
@@ -522,6 +524,40 @@ class HaxeLanguageServer(SolidLanguageServer):
         log.info(f"Auto-discovered Haxe build file: {best_hxml} (from {len(hxml_files)} candidates)")
         return [best_hxml]
 
+    @staticmethod
+    def _extract_classpath_folders(display_arguments: list[str], repository_absolute_path: str) -> list[str]:
+        """Extract source folder paths from display arguments for renameSourceFolders.
+
+        Parses -cp / --class-path arguments from .hxml files or direct arguments
+        and returns them as relative paths suitable for the Haxe LSP.
+        Falls back to ["src"] if nothing is found.
+        """
+        classpaths: list[str] = []
+        for arg in display_arguments:
+            if arg.endswith(".hxml"):
+                hxml_path = os.path.join(repository_absolute_path, arg)
+                if os.path.isfile(hxml_path):
+                    try:
+                        with open(hxml_path, encoding="utf-8") as f:
+                            content = f.read()
+                        for match in re.finditer(r"(?:^|\n)\s*-cp\s+(\S+)", content):
+                            classpaths.append(match.group(1))
+                        for match in re.finditer(r"(?:^|\n)\s*--class-path\s+(\S+)", content):
+                            classpaths.append(match.group(1))
+                    except OSError:
+                        pass
+            elif arg in ("-cp", "--class-path"):
+                # Direct arguments: next arg would be the path, but we don't have pair info here
+                pass
+
+        if not classpaths:
+            # Sensible default — most Haxe projects use src/
+            src_dir = os.path.join(repository_absolute_path, "src")
+            if os.path.isdir(src_dir):
+                classpaths = ["src"]
+
+        return classpaths
+
     def _start_server(self) -> None:
         """
         Starts the Haxe Language Server and waits for compilation to complete.
@@ -536,15 +572,30 @@ class HaxeLanguageServer(SolidLanguageServer):
             return
 
         def diagnostics_handler(params: dict) -> None:
-            """Signal compilation complete when the first diagnostics arrive.
+            """Signal compilation complete when diagnostics arrive.
 
             The Haxe LSP always publishes textDocument/publishDiagnostics after
-            compilation finishes (even an empty list for clean code). This is more
-            reliable than $/progress tokens which may not arrive in time on slow
-            CI runners.
+            compilation finishes (even an empty list for clean code). However, if
+            progress tokens are still active, we defer to the progress_handler to
+            avoid a race where diagnostics arrive before progress ends.
             """
-            log.info("Haxe LSP published diagnostics — compilation complete")
-            self._compilation_complete.set()
+            uri = params.get("uri", "unknown")
+            diags = params.get("diagnostics", [])
+            errors = [d for d in diags if d.get("severity") == 1]
+            if errors:
+                log.warning("Haxe LSP diagnostics for %s: %d errors: %s", uri, len(errors), errors)
+            else:
+                log.info("Haxe LSP diagnostics for %s: clean (%d total)", uri, len(diags))
+
+            with self._progress_lock:
+                if not self._active_progress_tokens:
+                    log.info("Haxe LSP: no active progress tokens — signalling compilation complete")
+                    self._compilation_complete.set()
+                else:
+                    log.info(
+                        "Haxe LSP: diagnostics received but %d progress tokens still active — deferring",
+                        len(self._active_progress_tokens),
+                    )
 
         def window_log_message(msg: dict) -> None:
             log.info(f"LSP: window/logMessage: {msg}")
