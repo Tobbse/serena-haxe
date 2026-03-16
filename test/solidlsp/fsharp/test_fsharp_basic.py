@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -15,6 +16,10 @@ from test.conftest import is_ci
 
 
 @pytest.mark.fsharp
+@pytest.mark.xfail(
+    sys.platform == "win32",
+    reason="FsAutoComplete fails with 'System.Array assembly not found' on Windows CI runners",
+)
 class TestFSharpLanguageServer:
     @pytest.mark.parametrize("language_server", [Language.FSHARP], indirect=True)
     def test_find_symbol(self, language_server: SolidLanguageServer) -> None:
