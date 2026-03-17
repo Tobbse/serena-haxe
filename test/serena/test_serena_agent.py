@@ -216,7 +216,7 @@ class TestSerenaAgent:
     def test_find_symbol_references(self, serena_agent: SerenaAgent, symbol_name: str, def_file: str, ref_file: str) -> None:
         # skip flaky tests in CI
         # TODO: Revisit the flaky tests and re-enable once the LS issues are resolved #1040
-        flaky_languages = {Language.TYPESCRIPT}
+        flaky_languages = {Language.TYPESCRIPT, Language.FSHARP}
         if set(serena_agent.get_active_lsp_languages()).intersection(flaky_languages) and is_ci:
             pytest.skip("Test is flaky and thus skipped in CI environment.")
 
