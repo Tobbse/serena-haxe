@@ -211,6 +211,7 @@ jobs:
           version: '1.10'
       - name: Install Julia LanguageServer
         shell: bash
+        timeout-minutes: 5
         run: julia -e 'using Pkg; Pkg.add("LanguageServer")'
       - name: Setup Haskell toolchain
         if: runner.os != 'Windows'
