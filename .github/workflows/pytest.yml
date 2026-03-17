@@ -600,10 +600,6 @@ jobs:
       - name: Test with pytest
         shell: bash
         run: uv run poe test
-      - name: Haxe and F# tests (dedicated output)
-        if: always()
-        shell: bash
-        run: uv run pytest test/solidlsp/haxe test/solidlsp/fsharp -vvv --timeout=300
       - name: Type-checking with mypy
         shell: bash
         run: uv run poe type-check

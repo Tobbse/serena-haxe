@@ -11,9 +11,7 @@ if language_tests_enabled(Language.PHP_PHPACTOR):
     _php_servers.append(Language.PHP_PHPACTOR)
 
 
-@pytest.mark.skipif(
-    is_ci and is_windows, reason="PHP tests timeout on Windows CI (phpactor hangs) #1040"
-)
+@pytest.mark.skipif(is_ci and is_windows, reason="PHP tests timeout on Windows CI (phpactor hangs) #1040")
 @pytest.mark.php
 class TestPhpLanguageServers:
     @pytest.mark.parametrize("language_server", _php_servers, indirect=True)
