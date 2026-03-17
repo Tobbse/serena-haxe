@@ -441,23 +441,24 @@ class HaxeLanguageServer(SolidLanguageServer):
             "locale": "en",
             "capabilities": {
                 "textDocument": {
-                    "synchronization": {"didSave": True},
-                    "completion": {"completionItem": {"snippetSupport": True}},
-                    "definition": {},
-                    "references": {},
+                    "synchronization": {"didSave": True, "dynamicRegistration": True},
+                    "completion": {"dynamicRegistration": True, "completionItem": {"snippetSupport": True}},
+                    "definition": {"dynamicRegistration": True},
+                    "references": {"dynamicRegistration": True},
                     "documentSymbol": {
+                        "dynamicRegistration": True,
                         "hierarchicalDocumentSymbolSupport": True,
                         "symbolKind": {"valueSet": list(range(1, 27))},
                     },
-                    "hover": {"contentFormat": ["markdown", "plaintext"]},
-                    "codeAction": {},
-                    "rename": {},
-                    "signatureHelp": {},
+                    "hover": {"dynamicRegistration": True, "contentFormat": ["markdown", "plaintext"]},
+                    "codeAction": {"dynamicRegistration": True},
+                    "rename": {"dynamicRegistration": True},
+                    "signatureHelp": {"dynamicRegistration": True},
                 },
                 "workspace": {
                     "workspaceFolders": True,
-                    "didChangeConfiguration": {},
-                    "symbol": {},
+                    "didChangeConfiguration": {"dynamicRegistration": True},
+                    "symbol": {"dynamicRegistration": True},
                 },
             },
             "initializationOptions": {
@@ -567,9 +568,6 @@ class HaxeLanguageServer(SolidLanguageServer):
         $/progress tokens as a secondary signal. The event is cleared before sending
         initialized and set when either signal arrives.
         """
-
-        def do_nothing(params: dict) -> None:
-            return
 
         def diagnostics_handler(params: dict) -> None:
             """Signal compilation complete when diagnostics arrive.
