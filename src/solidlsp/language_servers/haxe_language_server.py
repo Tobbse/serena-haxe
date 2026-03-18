@@ -23,7 +23,8 @@ from solidlsp.ls import (
     SymbolBody,
 )
 from solidlsp.ls_config import LanguageServerConfig
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
+from solidlsp.ls_exceptions import SolidLSPException
+from solidlsp.lsp_protocol_handler.lsp_types import DiagnosticSeverity, InitializeParams
 from solidlsp.settings import SolidLSPSettings
 
 log = logging.getLogger(__name__)
@@ -225,7 +226,12 @@ class HaxeLanguageServer(SolidLanguageServer):
         if not result.root_symbols:
             return result
 
-        self._fix_symbol_boundaries(result.root_symbols, relative_file_path)
+        # Only fix boundaries once — the base class caches and returns the same
+        # mutable DocumentSymbols object, so repeated calls would re-walk an
+        # already-fixed tree and re-read the file for no reason.
+        if not getattr(result, "_haxe_boundaries_fixed", False):
+            self._fix_symbol_boundaries(result.root_symbols, relative_file_path)
+            result._haxe_boundaries_fixed = True  # type: ignore[attr-defined]
 
         return result
 
@@ -244,7 +250,7 @@ class HaxeLanguageServer(SolidLanguageServer):
             result = super().request_hover(relative_file_path, line, column, file_buffer=file_buffer)
             if result is not None:
                 return result
-        except Exception:
+        except SolidLSPException:
             log.debug("Hover request failed, attempting fallback", exc_info=True)
 
         # Hover returned None or raised — try to find the symbol name from document symbols
@@ -258,7 +264,7 @@ class HaxeLanguageServer(SolidLanguageServer):
                     name = sym.get("name", "")
                     if name:
                         return {"contents": name}
-        except Exception:
+        except SolidLSPException:
             log.debug("Failed to synthesize hover from document symbols", exc_info=True)
 
         return None
@@ -267,16 +273,33 @@ class HaxeLanguageServer(SolidLanguageServer):
         """Walk the symbol tree and fix any symbols whose range extends
         beyond their actual body (common Haxe LSP bug).
         """
+        # Read the file once and pass to all calls to avoid N redundant reads
+        try:
+            abs_path = os.path.join(self.repository_root_path, relative_file_path)
+            with open(abs_path, encoding=self._encoding) as f:
+                lines = f.readlines()
+        except (OSError, FileNotFoundError):
+            return
+
+        stripped_lines = [line.rstrip("\n") for line in lines]
+        self._fix_symbol_boundaries_recursive(symbols, lines, stripped_lines)
+
+    def _fix_symbol_boundaries_recursive(
+        self,
+        symbols: list[ls_types.UnifiedSymbolInformation],
+        lines: list[str],
+        stripped_lines: list[str],
+    ) -> None:
         i = 0
         while i < len(symbols):
             symbol = symbols[i]
             children = symbol.get("children", [])
             if children:
                 # Recursively fix children first
-                self._fix_symbol_boundaries(children, relative_file_path)
+                self._fix_symbol_boundaries_recursive(children, lines, stripped_lines)
 
                 # Check if any children should actually be siblings
-                promoted = self._check_and_promote_children(symbol, relative_file_path)
+                promoted = self._check_and_promote_children(symbol, lines, stripped_lines)
                 if promoted:
                     # Insert promoted children as siblings after this symbol
                     for j, promoted_child in enumerate(promoted):
@@ -285,7 +308,10 @@ class HaxeLanguageServer(SolidLanguageServer):
             i += 1
 
     def _check_and_promote_children(
-        self, symbol: ls_types.UnifiedSymbolInformation, relative_file_path: str
+        self,
+        symbol: ls_types.UnifiedSymbolInformation,
+        lines: list[str],
+        stripped_lines: list[str],
     ) -> list[ls_types.UnifiedSymbolInformation]:
         """Check if a symbol's range is too large and some children should be siblings.
         Returns list of children to promote.
@@ -296,23 +322,13 @@ class HaxeLanguageServer(SolidLanguageServer):
 
         # Only check methods/functions — classes legitimately contain children
         sym_kind = symbol.get("kind", 0)
-        METHOD_KIND = 6  # LSP SymbolKind.Method
-        FUNCTION_KIND = 12  # LSP SymbolKind.Function
-        if sym_kind not in (METHOD_KIND, FUNCTION_KIND):
+        if sym_kind not in (ls_types.SymbolKind.Method, ls_types.SymbolKind.Function):
             return []
 
         # Get the symbol's reported range
         sym_range = symbol.get("location", {}).get("range", symbol.get("range", {}))
         sym_start_line: int = sym_range["start"]["line"]
         sym_end_line: int = sym_range["end"]["line"]
-
-        # Read the relevant lines from the file
-        try:
-            abs_path = os.path.join(self.repository_root_path, relative_file_path)
-            with open(abs_path, encoding=self._encoding) as f:
-                lines = f.readlines()
-        except (OSError, FileNotFoundError):
-            return []
 
         # Find the actual end of the method by counting brace depth
         actual_end_line = self._find_method_end(lines, sym_start_line)
@@ -340,7 +356,7 @@ class HaxeLanguageServer(SolidLanguageServer):
             # Rebuild the symbol body with corrected range
             if "body" in symbol:
                 symbol["body"] = SymbolBody(
-                    lines=[line.rstrip("\n") for line in lines],
+                    lines=stripped_lines,
                     start_line=sym_start_line,
                     start_col=sym_range["start"]["character"],
                     end_line=actual_end_line,
@@ -547,10 +563,6 @@ class HaxeLanguageServer(SolidLanguageServer):
                             classpaths.append(match.group(1))
                     except OSError:
                         pass
-            elif arg in ("-cp", "--class-path"):
-                # Direct arguments: next arg would be the path, but we don't have pair info here
-                pass
-
         if not classpaths:
             # Sensible default — most Haxe projects use src/
             src_dir = os.path.join(repository_absolute_path, "src")
@@ -579,7 +591,7 @@ class HaxeLanguageServer(SolidLanguageServer):
             """
             uri = params.get("uri", "unknown")
             diags = params.get("diagnostics", [])
-            errors = [d for d in diags if d.get("severity") == 1]
+            errors = [d for d in diags if d.get("severity") == DiagnosticSeverity.Error]
             if errors:
                 log.warning("Haxe LSP diagnostics for %s: %d errors: %s", uri, len(errors), errors)
             else:
