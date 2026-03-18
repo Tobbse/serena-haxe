@@ -67,6 +67,7 @@ class HaxeLanguageServer(SolidLanguageServer):
         self._compilation_complete = threading.Event()
         self._compilation_complete.set()
         self._active_progress_tokens: set[str] = set()
+        self._diagnostics_received = False
         self._progress_lock = threading.Lock()
 
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
@@ -598,6 +599,7 @@ class HaxeLanguageServer(SolidLanguageServer):
                 log.info("Haxe LSP diagnostics for %s: clean (%d total)", uri, len(diags))
 
             with self._progress_lock:
+                self._diagnostics_received = True
                 if not self._active_progress_tokens:
                     log.info("Haxe LSP: no active progress tokens — signalling compilation complete")
                     self._compilation_complete.set()
@@ -646,7 +648,10 @@ class HaxeLanguageServer(SolidLanguageServer):
                 log.info(f"Haxe LSP progress [{token}]: ended - {msg}")
                 with self._progress_lock:
                     self._active_progress_tokens.discard(token)
-                    if not self._active_progress_tokens:
+                    if not self._active_progress_tokens and self._diagnostics_received:
+                        # All progress done AND diagnostics were already received
+                        # (deferred while tokens were active) — signal now.
+                        log.info("Haxe LSP: all progress tokens ended with diagnostics received — signalling complete")
                         self._compilation_complete.set()
 
         self.server.on_request("client/registerCapability", register_capability_handler)
@@ -665,6 +670,7 @@ class HaxeLanguageServer(SolidLanguageServer):
         # Clear the event BEFORE sending initialized so wait() blocks until
         # the Haxe LSP publishes diagnostics (= compilation finished).
         self._compilation_complete.clear()
+        self._diagnostics_received = False
         self.server.notify.initialized({})
 
         # Force didChangeConfiguration — some Haxe LSP versions require this to properly start
