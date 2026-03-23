@@ -52,8 +52,11 @@ Some languages require additional installations or setup steps, as noted.
   (requires installation of `gopls`)
 * **Groovy**  
   (requires local groovy-language-server.jar setup via `GROOVY_LS_JAR_PATH` or configuration)
-* **Haskell**  
+* **Haskell**
   (automatically locates HLS via ghcup, stack, or system PATH; supports Stack and Cabal projects)
+* **Haxe**
+  (requires Haxe compiler 3.4.0+ and Node.js; uses the [vshaxe language server](https://github.com/vshaxe/haxe-language-server);
+  auto-discovered from the vshaxe VSCode extension or set `ls_path` in `ls_specific_settings`)
 * **Java**  
 * **JavaScript**
 * **Julia**

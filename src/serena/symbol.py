@@ -13,6 +13,7 @@ import serena.jetbrains.jetbrains_types as jb
 from solidlsp import SolidLanguageServer
 from solidlsp.ls import LSPFileBuffer
 from solidlsp.ls import ReferenceInSymbol as LSPReferenceInSymbol
+from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.ls_types import Position, SymbolKind, UnifiedSymbolInformation
 
 from .ls_manager import LanguageServerManager
@@ -557,7 +558,11 @@ class LanguageServerSymbolRetriever:
         Returns None if no information is available.
         """
         lang_server = self.get_language_server(relative_file_path)
-        hover_info = lang_server.request_hover(relative_file_path=relative_file_path, line=line, column=column, file_buffer=file_buffer)
+        try:
+            hover_info = lang_server.request_hover(relative_file_path=relative_file_path, line=line, column=column, file_buffer=file_buffer)
+        except SolidLSPException:
+            log.debug("Hover request failed for %s:%d:%d", relative_file_path, line, column, exc_info=True)
+            return None
         if hover_info is None:
             return None
 
