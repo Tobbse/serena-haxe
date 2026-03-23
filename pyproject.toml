@@ -134,7 +134,7 @@ type = "simple"
 # Uses PYTEST_MARKERS env var for default markers
 # For custom markers, one can either adjust the env var or just use -m option in the command line,
 # as the second -m option will override the first one.
-test = "pytest test -vv"
+test = "pytest test -vv --timeout=300"
 _black_check = "black --check src scripts test"
 _ruff_check = "ruff check src scripts test"
 _black_format = "black src scripts test"
@@ -318,6 +318,7 @@ markers = [
   "julia: Julia language server tests",
   "fortran: language server running for Fortran",
   "haskell: Haskell language server tests",
+  "haxe: Haxe language server tests",
   "yaml: language server running for YAML",
   "powershell: language server running for PowerShell",
   "pascal: language server running for Pascal (Free Pascal/Lazarus)",
