@@ -56,6 +56,13 @@ ignore_all_files_in_gitignore: true
 # Maps the language key to the options.
 # Have a look at the docstring of the constructors of the LS implementations within solidlsp (e.g., for C# or PHP) to see which options are available.
 # No documentation on options means no options are available.
+# Example (Haxe — full reference in docs/02-usage/050_configuration.md):
+#   ls_specific_settings:
+#     haxe:
+#       buildFile: build-html5-debug.hxml   # .hxml build file (relative to projectRoot when set)
+#       projectRoot: Frontend/client        # Haxe compiler working dir (--cwd) for monorepo sub-projects
+#       compilationTimeout: 240             # seconds to wait for the server to warm up at startup
+#       warmup: true                        # warm the first compile at startup (default true)
 ls_specific_settings: {}
 
 # list of additional workspace folder paths for cross-package reference support (e.g. in monorepos).

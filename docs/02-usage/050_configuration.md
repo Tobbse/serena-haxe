@@ -639,7 +639,11 @@ Supported settings:
 |---|---|---|
 | `ls_path` | auto-discovered | Path to the Haxe language server binary (e.g., `/path/to/server.js`). |
 | `version` | `2.34.2` | Override the vshaxe extension version downloaded from Open VSX. SHA256 verification is only performed for the default version. |
-| `buildFile` | auto-discovered `.hxml` | Relative path to the `.hxml` build file used for compilation (e.g., `build/debug.hxml`). If not set, Serena searches the project for `.hxml` files (max depth 5, skipping dependency directories). |
+| `buildFile` | auto-discovered `.hxml` | Relative path to the `.hxml` build file (e.g. `build/debug.hxml`); relative to `projectRoot` when that is set. If unset, Serena auto-discovers one (if several match, it warns and picks the shallowest path — set this to choose explicitly). |
+| `projectRoot` | repository root | Directory the Haxe compiler runs in (passed as `--cwd`). Set it for monorepos where the project root sits above the Haxe sub-project — see below. |
+| `compilationTimeout` | `240` | Seconds to wait at startup for the server to finish compiling and warming up. Raise it for very large projects. |
+| `warmup` | `true` | Warm the compiler at startup so the *first* `find_*` call is fast instead of slow. Leave on unless it causes trouble. |
+| `warmupFile` | `-main` module, else first `.hx` | Repo-relative file to warm with. Override when the automatic choice is unsuitable. |
 | `haxePath` | `haxe` from PATH | Path to the Haxe compiler executable. The LS delegates to this for code analysis. Useful when multiple Haxe versions are installed or when `haxe` is not on the PATH. |
 | `renameSourceFolders` | not set (LS default) | List of source directories for scoping rename operations (e.g., `["src", "lib"]`). If not set, the Haxe LS uses its own defaults. |
 
@@ -652,6 +656,30 @@ ls_specific_settings:
     haxePath: "/usr/local/bin/haxe"
     renameSourceFolders: ["src", "lib"]
 ```
+
+##### Large Haxe projects and monorepos
+
+The first compiler-backed request on a large project can be slow: the server must compile, parse classpaths
+and build its cache before it can answer. Serena pays this cost at startup (`warmup`). If the first call
+still times out, raise `compilationTimeout` (the startup budget) and make sure the global `tool_timeout`
+isn't set too low (default 240s). Either way the server keeps compiling in the background, so a retry a
+minute later is fast.
+
+In a **monorepo** where the Haxe code lives in a sub-directory (e.g. `Frontend/client`) and its `.hxml` uses
+relative paths, either:
+
+- open the sub-project (`Frontend/client`) directly as the Serena project, or
+- keep the repo root and set `projectRoot` (the compiler's `--cwd`) plus `buildFile`:
+
+  ```yaml
+  ls_specific_settings:
+    haxe:
+      projectRoot: "Frontend/client"      # the Haxe compiler's --cwd
+      buildFile: "build-html5-debug.hxml" # relative to projectRoot
+  ```
+
+  `buildFile` alone is not enough: without `projectRoot` the compiler can't resolve the `.hxml`'s relative
+  includes (you get `ENOENT` errors and broken go-to-definition, though `find_symbol` by name still works).
 
 #### HTML
 
