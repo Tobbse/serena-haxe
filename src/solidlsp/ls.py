@@ -1081,6 +1081,28 @@ class SolidLanguageServer(ABC):
         """Check if a relative path traverses outside the workspace root via '..' components."""
         return ".." in PurePath(relative_file_path).parts
 
+    def is_path_in_configured_workspaces(self, absolute_path: str) -> bool:
+        """Whether an absolute path lies within the repository root or any additional workspace folder.
+
+        Mirrors the workspace-membership check in ``_resolve_file_uri`` so that location results pointing
+        outside all configured workspaces (e.g. into the language's standard library or installed packages)
+        can be detected and skipped before they reach ``_resolve_file_uri`` (which would raise on them).
+        """
+        resolved = pathlib.Path(absolute_path).resolve()
+        for workspace in [*self._additional_workspace_abs_paths, self.repository_root_path]:
+            if resolved.is_relative_to(workspace):
+                return True
+        return False
+
+    def describe_busy_state(self) -> str:
+        """Human-readable description of any in-progress background work (compilation, indexing, …).
+
+        Appended to request-timeout error messages for diagnosability. The base implementation has no
+        insight into background work and returns an empty string; subclasses (e.g. Haxe) override this
+        to report compiler / cache state.
+        """
+        return ""
+
     def _resolve_file_uri(self, relative_file_path: str) -> str:
         """Construct a canonical file URI from a relative path.
 
@@ -1090,13 +1112,8 @@ class SolidLanguageServer(ABC):
         p = pathlib.Path(os.path.join(self.repository_root_path, relative_file_path))
         if self._path_contains_dots(relative_file_path):
             p = p.resolve()
-            is_outside_of_configured_workspaces = True
-            configured_workspaces = [*self._additional_workspace_abs_paths, self.repository_root_path]
-            for workspace in configured_workspaces:
-                if p.is_relative_to(workspace):
-                    is_outside_of_configured_workspaces = False
-                    break
-            if is_outside_of_configured_workspaces:
+            if not self.is_path_in_configured_workspaces(str(p)):
+                configured_workspaces = [*self._additional_workspace_abs_paths, self.repository_root_path]
                 raise ValueError(
                     f"Path {relative_file_path} contains '..' segments and is outside of configured workspaces. "
                     f"Configured workspaces: {configured_workspaces}. Resolved path: {p}."
@@ -1450,6 +1467,8 @@ class SolidLanguageServer(ABC):
             self.column = column
             self.request_name = request_name
             self.skip_ignored_paths = True
+            # Set just before the request is sent (in execute); used to report elapsed time on timeout.
+            self._request_started_at: float | None = None
 
         def execute(self) -> list[ls_types.Location]:
             self._ensure_server_started()
@@ -1457,6 +1476,7 @@ class SolidLanguageServer(ABC):
             t0 = perf_counter() if _debug_enabled else None
             with self.language_server.open_file(self.relative_file_path):
                 self.language_server._wait_for_cross_file_references_if_needed()
+                self._request_started_at = perf_counter()
                 try:
                     response = self.send_request()
                 except Exception as e:
@@ -1480,6 +1500,14 @@ class SolidLanguageServer(ABC):
             pass
 
         def map_exception(self, error: Exception) -> Exception | None:
+            if isinstance(error, TimeoutError):
+                detail = f"{self.request_name} on {self.relative_file_path}:{self.line}:{self.column} timed out"
+                if self._request_started_at is not None:
+                    detail += f" after {perf_counter() - self._request_started_at:.1f}s"
+                busy = self.language_server.describe_busy_state()
+                if busy:
+                    detail += f"; {busy}"
+                return TimeoutError(f"{detail} (original: {error})")
             if isinstance(error, LSPError) and getattr(error, "code", None) == -32603:
                 return RuntimeError(
                     f"LSP internal error (-32603) when requesting {self.request_name} for "
@@ -1510,7 +1538,14 @@ class SolidLanguageServer(ABC):
             abs_path = PathUtils.uri_to_path(uri)
             rel_path_str = PathUtils.get_relative_path(abs_path, self.language_server.repository_root_path)
 
-            if rel_path_str is None:
+            # Skip locations outside the repository / configured workspaces. On non-Windows platforms
+            # get_relative_path returns a '..'-laden path (not None) for such locations -- e.g. a definition
+            # resolving into the language's standard library -- which would otherwise make the follow-up
+            # _resolve_file_uri raise. Detect and skip them here regardless of drive.
+            if rel_path_str is None or (
+                self.language_server._path_contains_dots(rel_path_str)
+                and not self.language_server.is_path_in_configured_workspaces(abs_path)
+            ):
                 log.warning(
                     "Found a %s in a path outside the repository, probably the LS is parsing things in installed packages or in the standardlib! "
                     "Path: %s. This is a bug but we currently simply skip these locations.",

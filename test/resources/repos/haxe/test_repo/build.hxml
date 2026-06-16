@@ -1,3 +1,8 @@
 -cp src
 -main Main
+# Force-compile the inheritance fixtures so the language server always has them
+# in its typed context (textDocument/implementation only reports typed implementors).
+shapes.Circle
+shapes.Square
+animals.Dog
 --no-output

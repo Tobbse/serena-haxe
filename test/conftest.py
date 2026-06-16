@@ -355,6 +355,7 @@ _VERIFIED_IMPLEMENTATION_LANGUAGES = {
     Language.ANGULAR,
     Language.CSHARP,
     Language.GO,
+    Language.HAXE,
     Language.JAVA,
     Language.RUST,
     Language.TYPESCRIPT,

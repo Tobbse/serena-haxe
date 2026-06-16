@@ -6,6 +6,7 @@ from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
 from solidlsp.ls_utils import SymbolUtils
+from test.conftest import find_identifier_position, get_repo_path, language_has_verified_implementation_support
 from test.solidlsp.conftest import format_symbol_for_assert, has_malformed_name, request_all_symbols
 
 
@@ -177,6 +178,34 @@ class TestHaxeLanguageServer:
         assert 18 in definition_lines, f"Expected definition of addNumbers at line 18 in Helper.hx, got lines {definition_lines}"
 
     @pytest.mark.parametrize("language_server", [Language.HAXE], indirect=True)
+    def test_find_declaration_of_stdlib_symbol_returns_none(self, language_server: SolidLanguageServer) -> None:
+        """request_defining_symbol on a symbol whose definition lives in the Haxe stdlib (outside the
+        project root) must return None gracefully -- not raise ValueError for an out-of-workspace path.
+
+        Regression test for the find_declaration Haxe crash: the stdlib definition location used to leak a
+        '..'-laden relative path (get_relative_path only returned None for cross-drive paths), so the
+        follow-up _request_symbol_at_location -> _resolve_file_uri raised
+        "contains '..' segments and is outside of configured workspaces".
+        """
+        main_path = os.path.join("src", "Main.hx")
+        # Line 38 (0-indexed: 37): `\t\tSys.println(app.calculateResult());`
+        # `Sys` (the stdlib class) starts at character 2; its definition is in the Haxe stdlib, outside the repo.
+        defining_symbol = language_server.request_defining_symbol(main_path, 37, 2)
+        assert defining_symbol is None, f"Expected None for a stdlib symbol whose definition is outside the project, got {defining_symbol}"
+
+    @pytest.mark.parametrize("language_server", [Language.HAXE], indirect=True)
+    def test_find_declaration_of_in_repo_symbol_resolves(self, language_server: SolidLanguageServer) -> None:
+        """request_defining_symbol on an in-repo cross-file symbol (addNumbers, defined in Helper.hx) must
+        still resolve to the defining symbol -- guards against the out-of-workspace skip over-filtering
+        valid in-project locations.
+        """
+        main_path = os.path.join("src", "Main.hx")
+        # Line 17 (0-indexed: 16): `\t\tcount = Helper.addNumbers(5, 10);` -- addNumbers is defined in Helper.hx.
+        defining_symbol = language_server.request_defining_symbol(main_path, 16, 17)
+        assert defining_symbol is not None, "Expected to resolve the defining symbol for addNumbers"
+        assert defining_symbol["name"] == "addNumbers", f"Expected 'addNumbers', got {defining_symbol.get('name')}"
+
+    @pytest.mark.parametrize("language_server", [Language.HAXE], indirect=True)
     def test_hover(self, language_server: SolidLanguageServer) -> None:
         file_path = os.path.join("src", "Main.hx")
         result = language_server.request_document_symbols(file_path)
@@ -275,3 +304,31 @@ class TestHaxeLanguageServer:
         assert hover1 is not None, "First hover returned None"
         assert refs, "References returned empty after switching files"
         assert hover2 is not None, "Second hover returned None after file switching"
+
+    if language_has_verified_implementation_support(Language.HAXE):
+
+        @pytest.mark.parametrize("language_server", [Language.HAXE], indirect=True)
+        def test_find_implementations_of_interface(self, language_server: SolidLanguageServer) -> None:
+            """textDocument/implementation on the `Shape` interface must yield its in-project implementors."""
+            shape_path = os.path.join("src", "shapes", "Shape.hx")
+            pos = find_identifier_position(get_repo_path(Language.HAXE) / "src" / "shapes" / "Shape.hx", "Shape")
+            assert pos is not None, "Could not locate the `Shape` interface in the fixture"
+
+            implementations = language_server.request_implementation(shape_path, *pos)
+            assert implementations, f"Expected implementors of Shape, got {implementations}"
+            impl_files = {os.path.basename(impl.get("relativePath", "")) for impl in implementations}
+            assert {"Circle.hx", "Square.hx"} <= impl_files, f"Expected Circle and Square as implementors, got {impl_files}"
+
+        @pytest.mark.parametrize("language_server", [Language.HAXE], indirect=True)
+        def test_request_implementing_symbols_of_base_method(self, language_server: SolidLanguageServer) -> None:
+            """request_implementing_symbols on `Animal.speak` must yield the overriding `Dog.speak`."""
+            animal_path = os.path.join("src", "animals", "Animal.hx")
+            pos = find_identifier_position(get_repo_path(Language.HAXE) / "src" / "animals" / "Animal.hx", "speak")
+            assert pos is not None, "Could not locate `speak` in the fixture"
+
+            implementing_symbols = language_server.request_implementing_symbols(animal_path, *pos)
+            assert implementing_symbols, f"Expected implementing symbols for Animal.speak, got {implementing_symbols}"
+            assert any(
+                symbol.get("name") == "speak" and "Dog.hx" in symbol.get("location", {}).get("relativePath", "")
+                for symbol in implementing_symbols
+            ), f"Expected Dog.speak among implementing symbols, got {implementing_symbols}"
