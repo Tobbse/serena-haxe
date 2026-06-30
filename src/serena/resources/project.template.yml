@@ -62,6 +62,7 @@ ignore_all_files_in_gitignore: true
 #       buildFile: build-html5-debug.hxml   # .hxml build file (relative to projectRoot when set)
 #       projectRoot: Frontend/client        # Haxe compiler working dir (--cwd) for monorepo sub-projects
 #       compilationTimeout: 240             # seconds to wait for the server to warm up at startup
+#       requestTimeout: 60                  # seconds a compiler-backed request may run (default; raise for very large repos, then set tool_timeout >= requestTimeout + 5)
 #       warmup: true                        # warm the first compile at startup (default true)
 ls_specific_settings: {}
 

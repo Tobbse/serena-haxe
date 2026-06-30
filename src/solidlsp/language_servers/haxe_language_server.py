@@ -61,12 +61,32 @@ class HaxeLanguageServer(SolidLanguageServer):
     # The default covers the measured one-time cold cost on a large repo (initial compile + classpath
     # parse + refactoring cache + the warm-up recompile ~= 180s) with margin.
     _COMPILATION_TIMEOUT_DEFAULT = 240.0
+    # Per-request budget (seconds) for compiler-backed LSP requests (find_declaration /
+    # find_implementations / safe_delete_symbol). Overridable via ls_specific_settings.haxe.requestTimeout.
+    # Most Haxe projects are small and the first compiler-backed request returns quickly, so the default is
+    # modest. On a *large* codebase the first request was measured at ~138s (and ultimately succeeds; warm
+    # requests are ~9s) -- such projects should raise this (and the global tool_timeout accordingly). Applied
+    # as a FLOOR (see set_request_timeout) so the configured value is not silently capped by a short global
+    # default (e.g. the ~25s a tool_timeout=30 yields).
+    _REQUEST_TIMEOUT_DEFAULT = 60.0
+    # The margin Serena subtracts when deriving the inner per-request budget from the outer per-tool
+    # timeout: ``ls_timeout = tool_timeout - 5`` (see src/serena/project.py). Used to infer the outer
+    # tool_timeout from the global value Serena passes to set_request_timeout, so we can warn when that
+    # outer ceiling would cut a slow Haxe request off before the configured requestTimeout elapses.
+    _LS_TIMEOUT_MARGIN = 5.0
     # How long the server must stay idle (no active progress tokens) before we declare it ready.
     # The Haxe LS starts its classpath parse / refactoring cache *after* the first idle, so we must
     # not declare ready at the first idle moment.
     _IDLE_SETTLE_WINDOW = 1.5
     # LSP MessageType.Error (the ``type`` field of window/logMessage params).
     _LSP_MESSAGE_TYPE_ERROR = 1
+
+    # States where the compiler stops publishing diagnostics entirely (unlike a normal compile error,
+    # which is still published). Reused as both the last compiler message and the unavailable reason.
+    _CACHE_BUILD_FAILED_MESSAGE = (
+        "haxe/cacheBuildFailed: the compiler could not build its cache (check the build file, classpaths, and that the project compiles)"
+    )
+    _KEEPS_CRASHING_MESSAGE = "haxe/haxeKeepsCrashing: the Haxe compiler is repeatedly crashing"
 
     def __init__(self, config: LanguageServerConfig, repository_root_path: str, solidlsp_settings: SolidLSPSettings):
         """Creates a HaxeLanguageServer instance. Use LanguageServer.create() instead."""
@@ -83,13 +103,21 @@ class HaxeLanguageServer(SolidLanguageServer):
         self._active_progress_tokens: set[str] = set()
         self._progress_lock = threading.Lock()
         self._last_compiler_message: str | None = None
+        # Set only when the compiler can't produce diagnostics at all, so an empty result can be
+        # flagged "compiler unavailable" rather than "clean".
+        self._diagnostics_unavailable_reason: str | None = None
+        # perf_counter time of the last crash signal, compared against a request's start time so a
+        # stale crash isn't blamed on a later request that merely timed out. None => no crash seen.
+        self._last_crash_signal_at: float | None = None
         self._compilation_timeout = self._resolve_compilation_timeout()
+        # Per-request floor: set_request_timeout raises the effective timeout to at least this, so the
+        # configured value survives a short global ls_timeout.
+        self._configured_request_timeout = self._resolve_request_timeout()
 
     @classmethod
     def supports_implementation_request(cls) -> bool:
-        # The vshaxe/haxe-language-server resolves textDocument/implementation for
-        # interface->implementor and base-class->subclass (verified empirically), even
-        # though it does not advertise `implementationProvider` in its server capabilities.
+        # vshaxe resolves textDocument/implementation (interface->implementor, base->subclass) even
+        # though it doesn't advertise implementationProvider in its capabilities.
         return True
 
     @override
@@ -310,19 +338,16 @@ class HaxeLanguageServer(SolidLanguageServer):
 
     @staticmethod
     def _discover_hxml_file(repository_absolute_path: str) -> list[str]:
-        """Auto-discover a single .hxml build file (as a one-element list), filtering out dependency
-        directories; returns ``[]`` if none are found.
+        """Auto-discover a single .hxml build file (one-element list), or [] if none.
 
-        When several candidates exist the choice is **non-silent and deterministic**: a warning lists
-        every candidate and the shallowest path (alphabetical tie-break) is used. For full control,
-        set ``ls_specific_settings.haxe.buildFile`` in ``serena_config.yml``.
+        On multiple candidates, warn and pick the shallowest path (alphabetical tie-break). Override
+        with ls_specific_settings.haxe.buildFile.
         """
         max_depth = 5
         skip_dirs = _DEPENDENCY_DIRS | {"build"}
 
         candidates: list[str] = []
         for root, dirs, files in os.walk(repository_absolute_path):
-            # Skip dependency/build output directories
             dirs[:] = [d for d in dirs if d not in skip_dirs]
             depth = len(pathlib.Path(root).relative_to(repository_absolute_path).parts)
             if depth > max_depth:
@@ -336,7 +361,7 @@ class HaxeLanguageServer(SolidLanguageServer):
             log.info("No .hxml file found in project")
             return []
 
-        # Deterministic order: shallowest path first, then alphabetical — never os.walk order.
+        # shallowest path first, then alphabetical (not os.walk order)
         candidates.sort(key=lambda rel: (len(pathlib.Path(rel).parts), rel))
         chosen = candidates[0]
 
@@ -374,11 +399,74 @@ class HaxeLanguageServer(SolidLanguageServer):
             )
             return self._COMPILATION_TIMEOUT_DEFAULT
 
-    def _handle_window_log_message(self, msg: dict) -> None:
-        """Log every window/logMessage and remember the latest error-severity one.
+    def _resolve_request_timeout(self) -> float:
+        """Per-request budget in seconds, from ls_specific_settings.haxe.requestTimeout.
 
-        The Haxe LS reports build errors this way; capturing the most recent one lets us attach the
-        likely cause to a subsequent failure or timeout (see ``describe_busy_state``).
+        Falls back to ``_REQUEST_TIMEOUT_DEFAULT`` for a missing or non-numeric value.
+        """
+        raw = self._custom_settings.get("requestTimeout")
+        if raw is None:
+            return self._REQUEST_TIMEOUT_DEFAULT
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            log.warning(
+                "Invalid ls_specific_settings.haxe.requestTimeout=%r (expected seconds); using default %.0fs",
+                raw,
+                self._REQUEST_TIMEOUT_DEFAULT,
+            )
+            return self._REQUEST_TIMEOUT_DEFAULT
+
+    @override
+    def set_request_timeout(self, timeout: float | None) -> None:
+        """Apply the configured Haxe request timeout as a floor, not a cap.
+
+        The Haxe compiler can be legitimately slow, so the effective request timeout must be at least
+        the configured value; a None global (block-forever) is also raised to the finite floor. This
+        governs only the inner LSP timeout — the outer per-tool-call timeout in tools_base.py is
+        separate and can't be raised here, so _warn_if_outer_tool_timeout_too_low flags it when tighter.
+        """
+        floor = self._configured_request_timeout
+        global_timeout = timeout
+        if timeout is None or timeout < floor:
+            if timeout is not None and timeout < floor:
+                log.info(
+                    "Haxe request timeout: raising the global per-request budget %.0fs to the configured "
+                    "floor %.0fs (ls_specific_settings.haxe.requestTimeout)",
+                    timeout,
+                    floor,
+                )
+            timeout = floor
+        super().set_request_timeout(timeout)
+        self._warn_if_outer_tool_timeout_too_low(global_timeout, floor)
+
+    def _warn_if_outer_tool_timeout_too_low(self, global_ls_timeout: float | None, request_floor: float) -> None:
+        """Warn when Serena's outer tool_timeout is tighter than the request floor, so it would cut a
+        slow Haxe request off before requestTimeout elapses.
+
+        We can only raise the inner LSP timeout from here, not tool_timeout, so the fix is the user's.
+        A None global means tool_timeout <= 0 (no outer cap) — nothing to warn about.
+        """
+        if global_ls_timeout is None:
+            return
+        implied_tool_timeout = global_ls_timeout + self._LS_TIMEOUT_MARGIN
+        if implied_tool_timeout < request_floor:
+            log.warning(
+                "Haxe requestTimeout=%.0fs will NOT be fully effective: Serena's global tool_timeout "
+                "(~%.0fs) is smaller, so the outer per-tool-call timeout cuts a slow Haxe request off "
+                "after ~%.0fs. Raise tool_timeout to at least %.0fs (>= requestTimeout + %.0fs) -- e.g. "
+                "`serena start-mcp-server --tool-timeout %.0f` or `tool_timeout:` in serena_config.yml.",
+                request_floor,
+                implied_tool_timeout,
+                implied_tool_timeout,
+                request_floor + self._LS_TIMEOUT_MARGIN,
+                self._LS_TIMEOUT_MARGIN,
+                request_floor + self._LS_TIMEOUT_MARGIN,
+            )
+
+    def _handle_window_log_message(self, msg: dict) -> None:
+        """Log each window/logMessage and remember the latest error one, to attach as the likely cause
+        of a later failure or timeout (see describe_busy_state).
         """
         log.info(f"LSP: window/logMessage: {msg}")
         if msg.get("type") == self._LSP_MESSAGE_TYPE_ERROR:
@@ -387,17 +475,28 @@ class HaxeLanguageServer(SolidLanguageServer):
                 self._last_compiler_message = str(text)
 
     def _handle_cache_build_failed(self, params: dict) -> None:
-        """Handle the haxe/cacheBuildFailed notification (previously logged as 'Unhandled method')."""
+        """Handle the haxe/cacheBuildFailed notification."""
         log.warning("Haxe LSP: cache build failed (haxe/cacheBuildFailed): %s", params)
-        self._last_compiler_message = (
-            "haxe/cacheBuildFailed: the compiler could not build its cache "
-            "(check the build file, classpaths, and that the project compiles)"
-        )
+        self._last_compiler_message = self._CACHE_BUILD_FAILED_MESSAGE
+        self._diagnostics_unavailable_reason = self._CACHE_BUILD_FAILED_MESSAGE
+        self._last_crash_signal_at = time.perf_counter()
 
     def _handle_haxe_keeps_crashing(self, params: dict) -> None:
-        """Handle the haxe/haxeKeepsCrashing notification (previously logged as 'Unhandled method')."""
+        """Handle the haxe/haxeKeepsCrashing notification."""
         log.warning("Haxe LSP: the Haxe compiler keeps crashing (haxe/haxeKeepsCrashing): %s", params)
-        self._last_compiler_message = "haxe/haxeKeepsCrashing: the Haxe compiler is repeatedly crashing"
+        self._last_compiler_message = self._KEEPS_CRASHING_MESSAGE
+        self._diagnostics_unavailable_reason = self._KEEPS_CRASHING_MESSAGE
+        self._last_crash_signal_at = time.perf_counter()
+
+    @override
+    def get_diagnostics_unavailable_reason(self) -> str | None:
+        """Reason the compiler can't produce trustworthy diagnostics (cache-build failure or repeated
+        crashing), else None.
+
+        A plain compile error doesn't count — the LS still publishes it as a diagnostic, so only the
+        cacheBuildFailed / haxeKeepsCrashing notifications set the reason.
+        """
+        return self._diagnostics_unavailable_reason
 
     @override
     def describe_busy_state(self) -> str:
@@ -409,6 +508,63 @@ class HaxeLanguageServer(SolidLanguageServer):
         if self._last_compiler_message:
             bits.append(f"last compiler message: {self._last_compiler_message}")
         return "; ".join(bits)
+
+    def _crash_is_current_for_request(self, request_started_at: float | None) -> bool:
+        """Whether there's genuine, current evidence that the compiler crashed for this request.
+
+        Either the process is dead now, or a crash notification was recorded at/after the request
+        started (an earlier one is stale and isn't blamed on this request). A crash is never inferred
+        from the timeout itself: if the start time is unknown, only a dead process counts.
+        """
+        # A dead process is current crash evidence; if liveness is unknown, don't assume a crash.
+        try:
+            process_dead = not self.is_running()
+        except Exception:
+            process_dead = False
+        if process_dead:
+            return True
+        if self._last_crash_signal_at is None or request_started_at is None:
+            return False
+        return self._last_crash_signal_at >= request_started_at
+
+    @override
+    def describe_request_timeout(
+        self,
+        *,
+        request_name: str,
+        relative_file_path: str,
+        line: int,
+        column: int,
+        elapsed: float | None,
+        request_started_at: float | None,
+    ) -> str:
+        """Honest framing for a Haxe request that exceeded its timeout.
+
+        Distinguishes a timeout (slow but not crashed) from a genuine, current crash, and omits the
+        stale last-compiler-message so a slow first compile isn't misreported as a crash.
+        """
+        where = f"{request_name} on {relative_file_path}:{line}:{column}"
+        after = f" after {elapsed:.1f}s" if elapsed is not None else ""
+
+        if self._crash_is_current_for_request(request_started_at):
+            # current crash: report it as a crash, with the recorded reason
+            reason = self._last_compiler_message or "the Haxe language-server process is not running"
+            return (
+                f"{where} failed{after}: the Haxe compiler CRASHED during this request ({reason}). This is a genuine crash, not a timeout."
+            )
+
+        # timeout: omit the stale last-compiler-message and avoid the word "crash" entirely
+        with self._progress_lock:
+            n_tokens = len(self._active_progress_tokens)
+        still_compiling = f" The compiler is still working ({n_tokens} progress token(s) active)." if n_tokens else ""
+        return (
+            f"{where} TIMED OUT{after}. This is a timeout, not a compiler failure: the Haxe compiler can "
+            f"be slow on large codebases -- the first compiler-backed request may take minutes (then later "
+            f"ones are fast).{still_compiling} If this keeps happening, raise the timeout via "
+            f"ls_specific_settings.haxe.requestTimeout (seconds; current floor {self._configured_request_timeout:.0f}s) "
+            f"and ensure the global tool_timeout is at least requestTimeout + {self._LS_TIMEOUT_MARGIN:.0f}s, "
+            f"otherwise the outer per-tool-call timeout will cut the request off first."
+        )
 
     def _handle_diagnostics(self, params: dict) -> None:
         """Signal idle when diagnostics arrive, unless progress tokens are still active (race guard)."""
@@ -464,14 +620,13 @@ class HaxeLanguageServer(SolidLanguageServer):
                     self._server_ready.set()
 
     def _await_stable_idle(self, timeout: float, settle_window: float, poll_interval: float = 0.05) -> bool:
-        """Block until the server has been continuously idle (no active progress tokens) for
-        ``settle_window`` seconds, or until ``timeout`` seconds elapse.
+        """Block until the server stays idle (no active progress tokens) for ``settle_window`` seconds,
+        or until ``timeout`` elapses.
 
-        The Haxe LS goes briefly idle after its first ``Building Cache`` run and only then starts the
-        classpath parse / refactoring cache. Waiting for *stable* idle (rather than the first idle)
-        ensures those post-idle tokens are accounted for before we declare the server ready.
+        The Haxe LS goes briefly idle after its first cache build, then starts its classpath parse /
+        refactoring cache — so we wait for stable idle, not the first idle.
 
-        :return: True if stable idle was reached; False if the timeout elapsed first.
+        :return: True if stable idle was reached; False on timeout.
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -500,8 +655,7 @@ class HaxeLanguageServer(SolidLanguageServer):
     def _build_file_rel(self) -> str | None:
         """The repo-relative build file: the configured one, else the first auto-discovered .hxml.
 
-        Cached: auto-discovery walks the project tree, and this is read both when building the
-        compiler's displayArguments and again when picking the warm-up file.
+        Cached because discovery walks the tree and this is read for both displayArguments and warm-up.
         """
         configured = self._custom_settings.get("buildFile")
         if configured:
@@ -629,12 +783,9 @@ class HaxeLanguageServer(SolidLanguageServer):
 
     @override
     def _start_server(self) -> None:
-        """Start the Haxe Language Server and wait for it to reach stable idle.
+        """Start the Haxe Language Server and wait for stable idle before declaring it ready.
 
-        Uses textDocument/publishDiagnostics and $/progress tokens to track compilation activity, and
-        only declares the server ready once it has stayed idle for a short settle window — the Haxe LS
-        starts its classpath parse / refactoring cache *after* the first idle, so a naive
-        "ready on first idle" lets the first compiler-backed request collide with that work.
+        See _await_stable_idle for why stable idle, not the first idle.
         """
 
         def register_capability_handler(params: dict) -> None:

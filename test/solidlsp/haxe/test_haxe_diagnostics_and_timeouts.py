@@ -35,12 +35,18 @@ def test_window_log_message_captures_error_severity_only() -> None:
 
     # MessageType.Info (3) is not a compiler error -> not captured.
     ls._handle_window_log_message({"type": 3, "message": "just info"})
-    assert ls._last_compiler_message is None
+    # Read into a local before asserting: a direct ``assert ls._last_compiler_message is None``
+    # narrows the *attribute* to ``None`` for the rest of the function, and mypy cannot see that
+    # the later ``_handle_window_log_message`` call reassigns it -- which would collapse the
+    # error-severity assertions below to ``Never`` ("unreachable"). Locals keep the narrowing local.
+    msg_after_info = ls._last_compiler_message
+    assert msg_after_info is None
 
     # MessageType.Error (1) -> captured.
     ls._handle_window_log_message({"type": 1, "message": "Type not found : Foo"})
-    assert ls._last_compiler_message is not None
-    assert "Type not found : Foo" in ls._last_compiler_message
+    msg_after_error = ls._last_compiler_message
+    assert msg_after_error is not None
+    assert "Type not found : Foo" in msg_after_error
 
 
 def test_cache_build_failed_is_captured() -> None:

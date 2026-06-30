@@ -1082,12 +1082,7 @@ class SolidLanguageServer(ABC):
         return ".." in PurePath(relative_file_path).parts
 
     def is_path_in_configured_workspaces(self, absolute_path: str) -> bool:
-        """Whether an absolute path lies within the repository root or any additional workspace folder.
-
-        Mirrors the workspace-membership check in ``_resolve_file_uri`` so that location results pointing
-        outside all configured workspaces (e.g. into the language's standard library or installed packages)
-        can be detected and skipped before they reach ``_resolve_file_uri`` (which would raise on them).
-        """
+        """Whether an absolute path lies within the repository root or any additional workspace folder."""
         resolved = pathlib.Path(absolute_path).resolve()
         for workspace in [*self._additional_workspace_abs_paths, self.repository_root_path]:
             if resolved.is_relative_to(workspace):
@@ -1095,13 +1090,46 @@ class SolidLanguageServer(ABC):
         return False
 
     def describe_busy_state(self) -> str:
-        """Human-readable description of any in-progress background work (compilation, indexing, …).
+        """Background work in progress (compilation, indexing, …), for timeout messages.
 
-        Appended to request-timeout error messages for diagnosability. The base implementation has no
-        insight into background work and returns an empty string; subclasses (e.g. Haxe) override this
-        to report compiler / cache state.
+        Empty unless a subclass can report compiler/cache state.
         """
         return ""
+
+    def get_diagnostics_unavailable_reason(self) -> str | None:
+        """Reason diagnostics can't currently be trusted, or None if they can.
+
+        An empty result otherwise can't be told apart from a clean file. None unless a subclass can
+        detect that its compiler is unable to produce diagnostics (e.g. it crashed).
+        """
+        return None
+
+    def describe_request_timeout(
+        self,
+        *,
+        request_name: str,
+        relative_file_path: str,
+        line: int,
+        column: int,
+        elapsed: float | None,
+        request_started_at: float | None,
+    ) -> str | None:
+        """Subclass framing for a compiler-backed request that timed out.
+
+        A non-None return is used verbatim as the timeout message; None keeps the generic framing
+        (request context + :meth:`describe_busy_state`). Lets a slow-but-healthy server say so rather
+        than have the timeout read as a failure.
+
+        :param request_name: the request (e.g. ``request_definition``).
+        :param relative_file_path: the file the request was issued against.
+        :param line: the request position line.
+        :param column: the request position column.
+        :param elapsed: seconds the request ran before timing out, if known.
+        :param request_started_at: ``perf_counter`` value captured when the request was sent, if known
+            (used by subclasses to decide whether a crash signal is *current* to this request).
+        :return: the timeout message to use, or None to keep the generic framing.
+        """
+        return None
 
     def _resolve_file_uri(self, relative_file_path: str) -> str:
         """Construct a canonical file URI from a relative path.
@@ -1467,7 +1495,7 @@ class SolidLanguageServer(ABC):
             self.column = column
             self.request_name = request_name
             self.skip_ignored_paths = True
-            # Set just before the request is sent (in execute); used to report elapsed time on timeout.
+            # set in execute(); for elapsed-time reporting on timeout
             self._request_started_at: float | None = None
 
         def execute(self) -> list[ls_types.Location]:
@@ -1501,9 +1529,24 @@ class SolidLanguageServer(ABC):
 
         def map_exception(self, error: Exception) -> Exception | None:
             if isinstance(error, TimeoutError):
+                elapsed = perf_counter() - self._request_started_at if self._request_started_at is not None else None
+                # Let the server frame its own timeout message; fall back to generic framing if it
+                # returns None or has no such hook.
+                describe_timeout = getattr(self.language_server, "describe_request_timeout", None)
+                if describe_timeout is not None:
+                    custom = describe_timeout(
+                        request_name=self.request_name,
+                        relative_file_path=self.relative_file_path,
+                        line=self.line,
+                        column=self.column,
+                        elapsed=elapsed,
+                        request_started_at=self._request_started_at,
+                    )
+                    if custom is not None:
+                        return TimeoutError(custom)
                 detail = f"{self.request_name} on {self.relative_file_path}:{self.line}:{self.column} timed out"
-                if self._request_started_at is not None:
-                    detail += f" after {perf_counter() - self._request_started_at:.1f}s"
+                if elapsed is not None:
+                    detail += f" after {elapsed:.1f}s"
                 busy = self.language_server.describe_busy_state()
                 if busy:
                     detail += f"; {busy}"
@@ -1538,10 +1581,9 @@ class SolidLanguageServer(ABC):
             abs_path = PathUtils.uri_to_path(uri)
             rel_path_str = PathUtils.get_relative_path(abs_path, self.language_server.repository_root_path)
 
-            # Skip locations outside the repository / configured workspaces. On non-Windows platforms
-            # get_relative_path returns a '..'-laden path (not None) for such locations -- e.g. a definition
-            # resolving into the language's standard library -- which would otherwise make the follow-up
-            # _resolve_file_uri raise. Detect and skip them here regardless of drive.
+            # Skip locations outside the configured workspaces. On non-Windows, get_relative_path
+            # returns a '..'-laden path (not None) for these (e.g. into the stdlib), which would make
+            # the follow-up _resolve_file_uri raise.
             if rel_path_str is None or (
                 self.language_server._path_contains_dots(rel_path_str)
                 and not self.language_server.is_path_in_configured_workspaces(abs_path)

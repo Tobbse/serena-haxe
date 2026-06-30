@@ -189,9 +189,8 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
         parsed_include_kinds: Sequence[SymbolKind] | None = [SymbolKind(k) for k in include_kinds] if include_kinds else None
         parsed_exclude_kinds: Sequence[SymbolKind] | None = [SymbolKind(k) for k in exclude_kinds] if exclude_kinds else None
 
-        # per-language tool disabling (Behaviour 2): scope a whole-project search to the non-excluded
-        # languages. When a specific file is pinned, the refuse guard (Behaviour 1) has already run, so
-        # scoping here is a no-op for the single-file case.
+        # Scope a whole-project search to the non-excluded languages (a no-op when a file is pinned,
+        # since the refuse guard has already run).
         scoping = self.get_language_scoping(relative_path=(relative_path or "").strip())
 
         symbol_retriever = self.create_language_server_symbol_retriever()
@@ -523,7 +522,21 @@ class GetDiagnosticsForFileTool(Tool, ToolMarkerSymbolicRead):
                 name_path = owner_symbol.get_name_path()
             grouped_diagnostics.add(relative_path, name_path, diagnostic)
 
-        result = self._to_json(grouped_diagnostics.get_dict())
+        grouped_dict = grouped_diagnostics.get_dict()
+
+        # An empty result could mean "clean file" or "compiler couldn't produce diagnostics"; flag the
+        # latter so it isn't mistaken for clean.
+        if not grouped_dict:
+            lang_server = symbol_retriever.get_language_server(relative_path)
+            unavailable_reason = lang_server.get_diagnostics_unavailable_reason()
+            if unavailable_reason:
+                return (
+                    f"WARNING: diagnostics are unavailable for {relative_path} (the empty result below "
+                    f"does NOT mean the file is clean). Compiler unavailable: {unavailable_reason}\n"
+                    f"{self._to_json(grouped_dict)}"
+                )
+
+        result = self._to_json(grouped_dict)
         return self._limit_length(result, max_answer_chars)
 
 

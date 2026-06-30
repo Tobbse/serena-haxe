@@ -642,6 +642,7 @@ Supported settings:
 | `buildFile` | auto-discovered `.hxml` | Relative path to the `.hxml` build file (e.g. `build/debug.hxml`); relative to `projectRoot` when that is set. If unset, Serena auto-discovers one (if several match, it warns and picks the shallowest path — set this to choose explicitly). |
 | `projectRoot` | repository root | Directory the Haxe compiler runs in (passed as `--cwd`). Set it for monorepos where the project root sits above the Haxe sub-project — see below. |
 | `compilationTimeout` | `240` | Seconds to wait at startup for the server to finish compiling and warming up. Raise it for very large projects. |
+| `requestTimeout` | `60` | Seconds a single compiler-backed request (`find_declaration`, `find_implementations`, `safe_delete_symbol`) may run before timing out, applied as a **floor** (the global `tool_timeout`-derived budget cannot shrink it below this). Most Haxe projects are small and the first request is quick, so the default is modest. On a *very large* codebase the first request can take minutes (then later ones are fast) — raise this for such projects, and ensure the global `tool_timeout` is at least `requestTimeout + 5` (see the note below). |
 | `warmup` | `true` | Warm the compiler at startup so the *first* `find_*` call is fast instead of slow. Leave on unless it causes trouble. |
 | `warmupFile` | `-main` module, else first `.hx` | Repo-relative file to warm with. Override when the automatic choice is unsuitable. |
 | `haxePath` | `haxe` from PATH | Path to the Haxe compiler executable. The LS delegates to this for code analysis. Useful when multiple Haxe versions are installed or when `haxe` is not on the PATH. |
@@ -664,6 +665,26 @@ and build its cache before it can answer. Serena pays this cost at startup (`war
 still times out, raise `compilationTimeout` (the startup budget) and make sure the global `tool_timeout`
 isn't set too low (default 240s). Either way the server keeps compiling in the background, so a retry a
 minute later is fast.
+
+**Two timeouts apply to a compiler-backed request, and the outer one wins.** A `find_declaration` /
+`find_implementations` / `safe_delete_symbol` call is bounded by:
+
+1. the **inner** per-request LSP timeout — for Haxe this is `requestTimeout` (default 60s, applied as a
+   floor); and
+2. the **outer** per-tool-call timeout — the global `tool_timeout` (default 240s), from which Serena derives
+   the inner global budget as `tool_timeout - 5`.
+
+Because the outer `tool_timeout` cannot be raised per-language, **it must be at least `requestTimeout + 5`**,
+otherwise it cuts the request off first and the Haxe `requestTimeout` is effectively ignored (Serena logs a
+loud warning at startup when it detects this). With the defaults (`requestTimeout` 60s, `tool_timeout` 240s)
+this already holds, so most projects need no change — only raise `tool_timeout` when you raise `requestTimeout`
+above `tool_timeout - 5`. For example, to allow a 600s Haxe request, set
+`tool_timeout: 605` or higher (via `serena_config.yml`, or `serena start-mcp-server --tool-timeout 605`, or
+`.mcp.json`). The real-world report that motivated this: the user's `tool_timeout` was `30` (→ ~25s inner
+budget), which guillotined a first request that needed ~138s but would otherwise have **succeeded** — the
+compiler was slow, not crashed. When a Haxe request does exceed its timeout it now reports a clear **timeout**
+(naming `requestTimeout`), and only reports a **crash** when the compiler genuinely crashed during that
+request — a timeout is never reported as a crash.
 
 In a **monorepo** where the Haxe code lives in a sub-directory (e.g. `Frontend/client`) and its `.hxml` uses
 relative paths, either:
