@@ -35,6 +35,7 @@ from serena.config.serena_config import (
     ModeSelectionDefinitionWithAddedModes,
     ModeSelectionDefinitionWithBaseModes,
     NamedToolInclusionDefinition,
+    ProjectConfig,
     RegisteredProject,
     SerenaConfig,
     SerenaPaths,
@@ -63,6 +64,7 @@ from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
 from solidlsp.ls_config import Language
 from solidlsp.util import subprocess_util
+from solidlsp.util.subprocess_util import terminate_process_tree_with_kill_fallback
 
 if TYPE_CHECKING:
     from serena.gui_log_viewer import GuiLogViewer
@@ -640,12 +642,10 @@ class SerenaAgent:
         # determine the effective language backend for this session.
         # If a startup project is provided and has a per-project override, use it; otherwise use the global config.
         # Since we don't want to change the toolset after startup, the language backend cannot be changed within a running Serena session
-        self._language_backend = self.serena_config.language_backend
-        if registered_project_to_activate is not None and registered_project_to_activate.project_config.language_backend is not None:
-            self._language_backend = registered_project_to_activate.project_config.language_backend
-            log.info(f"Using language backend as configured in project.yml: {self._language_backend.name}")
-        else:
-            log.info(f"Using language backend from global configuration: {self._language_backend.name}")
+        self._language_backend = self.serena_config.determine_language_backend(
+            project_config=registered_project_to_activate.project_config if registered_project_to_activate is not None else None,
+            log_choice=True,
+        )
 
         # create the tool names mapping for prompts
         self._prompt_tool_names_mapping = self._create_prompt_tool_names_mapping(self._language_backend)
@@ -852,7 +852,24 @@ class SerenaAgent:
         return self._context
 
     def get_tool_description_override(self, tool_name: str) -> str | None:
-        return self._context.tool_description_overrides.get(tool_name, None)
+        """
+        :param tool_name: the name of the tool
+        :return: an overriding tool description, or ``None`` to use the tool's default description.
+            This composes the active context's description override (if any) with a per-language
+            caveat when the tool is disabled for one or more languages in the active project.
+        """
+        base_override = self._context.tool_description_overrides.get(tool_name, None)
+        caveat: str | None = None
+        if self._active_project is not None:
+            excluded_langs = self._active_project.project_config.excluded_languages_for_tool(tool_name)
+            if excluded_langs:
+                langs_str = ", ".join(sorted(lang.value for lang in excluded_langs))
+                caveat = f"Note: disabled for {langs_str} in this project (their files are skipped / refused)."
+        if caveat is None:
+            return base_override
+        if base_override is not None:
+            return f"{base_override.rstrip()}\n{caveat}"
+        return caveat
 
     def _check_shell_settings(self) -> None:
         # On Windows, Claude Code sets COMSPEC to Git-Bash (often even with a path containing spaces),
@@ -1053,6 +1070,11 @@ class SerenaAgent:
                 msg += f"\n{mode.prompt}"
         self._project_prompt_status.mark_mode_prompts_as_provided(session_id)
 
+        # inform about per-language tool disabling (so the agent can plan fallbacks)
+        per_language_tool_summary = self._format_excluded_tools_by_language_summary(proj.project_config)
+        if per_language_tool_summary:
+            msg += f"\n{per_language_tool_summary}"
+
         # add project-specific prompt
         if proj.project_config.initial_prompt:
             msg += f"\nProject-specific instructions:\n {proj.project_config.initial_prompt}"
@@ -1060,6 +1082,29 @@ class SerenaAgent:
         self._project_prompt_status.mark_project_activation_message_as_provided(session_id)
 
         return msg
+
+    @staticmethod
+    def _format_excluded_tools_by_language_summary(project_config: "ProjectConfig") -> str | None:
+        """
+        Builds the upfront summary of per-language tool disabling for the project activation message.
+
+        :param project_config: the active project's configuration
+        :return: a short summary, or ``None`` if no tools are disabled per language
+        """
+        excluded = project_config.excluded_tools_by_language
+        if not excluded:
+            return None
+        per_language = [
+            f"{lang.value} → {', '.join(tools)}" for lang, tools in sorted(excluded.items(), key=lambda item: item[0].value) if tools
+        ]
+        if not per_language:
+            return None
+        return (
+            "In this project the following tools are disabled per language: "
+            + "; ".join(per_language)
+            + ". For those languages, the tools' files are skipped (whole-project/search tools) or "
+            "refused (file-pinned tools); use text-based search (search_for_pattern) or read files directly instead."
+        )
 
     def _update_active_modes(self, log_message: bool = True) -> None:
         """
@@ -1202,6 +1247,7 @@ class SerenaAgent:
             self._update_active_tools()
 
         def init_project_services() -> None:
+            self._run_project_activation_command(project)
             self._init_active_project_language_backend()
 
         # initialise the project's language backend in the background
@@ -1215,6 +1261,48 @@ class SerenaAgent:
             self._dashboard_manager.update_active_project(self._active_project)
 
         return True
+
+    @staticmethod
+    def _run_project_activation_command(project: Project) -> None:
+        """
+        Runs the given project's activation_command (if set and the project is trusted).
+        Failures are logged.
+        """
+        activation_command = project.project_config.activation_command
+        if not activation_command:
+            return
+        if not project.is_trusted():
+            log.warning(
+                f"Project path {project.project_root} is not trusted, ignoring activation_command "
+                "from project configuration. To trust the project, modify the trusted path patterns "
+                "in the global configuration."
+            )
+            return
+        timeout = project.project_config.activation_command_timeout
+        cmd = subprocess_util.convert_shell_cmd(activation_command)
+        log.info(f"Running activation_command for project '{project.project_name}': {cmd}")
+        try:
+            with LogTime("Project activation command", logger=log):
+                p = subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    cwd=project.project_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **subprocess_util.subprocess_kwargs(),
+                )
+                try:
+                    _, stderr = p.communicate(timeout=timeout)
+                    if p.returncode != 0:
+                        log.error(f"activation_command for project '{project.project_name}' failed (exit {p.returncode}): {stderr.strip()}")
+                except subprocess.TimeoutExpired:
+                    log.error(
+                        f"Activation_command for project '{project.project_name}' timed out after "
+                        f"{timeout}s; terminating process and continuing with backend initialisation."
+                    )
+                    terminate_process_tree_with_kill_fallback(p, terminate_timeout=5.0, process_name="activation_command")
+        except Exception:
+            log.exception(f"Unexpected error running activation_command for project '{project.project_name}'")
 
     def _init_active_project_language_backend(self) -> None:
         """

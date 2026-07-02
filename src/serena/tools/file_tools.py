@@ -20,7 +20,6 @@ from serena.util.text_utils import (
     ReplacementOccurrence,
     expand_braces,
     glob_match,
-    search_files,
 )
 
 
@@ -599,40 +598,21 @@ class SearchForPatternTool(Tool):
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"Relative path {relative_path} does not exist.")
 
-        if restrict_search_to_code_files:
-            matches = self.project.search_source_files_for_pattern(
-                pattern=substring_pattern,
-                relative_path=relative_path,
-                context_lines_before=context_lines_before,
-                context_lines_after=context_lines_after,
-                paths_include_glob=paths_include_glob.strip(),
-                paths_exclude_glob=paths_exclude_glob.strip(),
-                multiline=multiline,
-            )
-        else:
-            if os.path.isfile(abs_path):
-                rel_paths_to_search = [relative_path]
-            else:
-                _dirs, rel_paths_to_search = scan_directory(
-                    path=abs_path,
-                    recursive=True,
-                    is_ignored_dir=self.project.is_ignored_path,
-                    is_ignored_file=self.project.is_ignored_path,
-                    relative_to=self.get_project_root(),
-                )
-            # TODO (maybe): not super efficient to walk through the files again and filter if glob patterns are provided
-            #   but it probably never matters and this version required no further refactoring
-            matches = search_files(
-                rel_paths_to_search,
-                substring_pattern,
-                context_lines_before=context_lines_before,
-                context_lines_after=context_lines_after,
-                file_reader=self.project.read_file,
-                root_path=self.get_project_root(),
-                paths_include_glob=paths_include_glob,
-                paths_exclude_glob=paths_exclude_glob,
-                multiline=multiline,
-            )
+        # per-language tool disabling (Behaviour 2): scope the search to exclude files of languages
+        # for which this tool is disabled, appending a coverage note if any were skipped
+        scoping = self.get_language_scoping(relative_path=relative_path)
+
+        matches = self.project.search_project_files_for_pattern(
+            pattern=substring_pattern,
+            relative_path=relative_path,
+            context_lines_before=context_lines_before,
+            context_lines_after=context_lines_after,
+            paths_include_glob=paths_include_glob.strip(),
+            paths_exclude_glob=paths_exclude_glob.strip(),
+            multiline=multiline,
+            code_files_only=restrict_search_to_code_files,
+            exclude_languages=scoping.excluded_languages,
+        )
 
         # group matches by file
         file_to_matches: dict[str, list[str]] = defaultdict(list)
@@ -659,6 +639,7 @@ class SearchForPatternTool(Tool):
             return f"Found {len(matches)} matches in {len(match_lines_by_file)} files."
 
         result = self._to_json(file_to_matches)
-        return self._limit_length(
+        limited = self._limit_length(
             result, max_answer_chars, shortened_result_factories=[make_lines_only, make_per_file_counts, make_summary]
         )
+        return scoping.with_note(limited)

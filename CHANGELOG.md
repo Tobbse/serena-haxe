@@ -5,7 +5,13 @@ Status of the `main` branch. Changes prior to the next official version change w
 * General:
   - Add notion of trusted projects via new global configuration setting `trusted_project_path_patterns`.
     Current effects:
-    - `ls_specific_settings` defined in project configurations will only be applied for trusted projects    
+    - `ls_specific_settings` defined in project configurations will only be applied for trusted projects
+    - `activation_command` (and `activation_command_timeout`) defined in project configurations will only
+      be executed for trusted projects: an optional shell command run in the project root before the
+      language backend initialises (e.g. to generate source files a language server needs to index).
+      Exit code is the primary completion signal; `activation_command_timeout` (default 180s) is a safety
+      backstop — on expiry the process is killed and activation continues. Failures and timeouts are
+      logged but do not abort activation.
   - Fix: context or mode argument referencing a known name (e.g. `--context anitgravity`) could result in   
     incorrect file access if a corresponding local file existed (e.g. `./antigravity` binary);
     file access is now guarded with path detection (file ending or path separator must be present)
@@ -18,6 +24,15 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Update prompts/instructions: Serena instructions manual, modes (editing, interactive) 
   - Allow structured tool output to be configured on a per-context basis, disabling it for Claude Code
     (which does not correctly unpack structured output) #1042
+  - Fix: Project-specific filtering of files for source files ignored the language backend. 
+    The check is really only possible for LSP. 
+  - Add project configuration option `excluded_tools_by_language`, which disables a specific tool for a
+    specific language only (useful in multi-language projects where a tool is unreliable for one language
+    but should remain available for the others). A disabled tool behaves as if that language's files did
+    not exist: calls that pin such a file are refused, while whole-project/search tools (e.g. `find_symbol`,
+    `search_for_pattern`) are transparently scoped to the remaining languages and report skipped files via
+    a short coverage note. The disabled tools are also summarised in the initial instructions and noted in
+    the affected tools' descriptions.
 
 * CLI:
   - Fix `--project-from-cwd` hijacking git worktrees nested under a Serena project. `find_project_root`
@@ -55,6 +70,8 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Add configuration option `jetbrains_launch_command`, allowing Serena to spawn IDE instances automatically
     upon project activation
   - Fix: `jet_brains_list_inspections` failed when only default parameters were used #1615 
+  - `jet_brains_find_symbol`: honour `excluded_tools_by_language` for whole-project searches, scoping the
+    results to the non-excluded languages and appending a coverage note (parity with the LSP backend)
 
 * Dashboard:
   - Make list of trusted hosts configurable, fixing host validation introduced in v1.5.2 allowing only
